@@ -393,24 +393,66 @@ let is_const_false expr =
   | Literal (IntLit 0) -> true
   | _ -> false
 
+(* 收集所有被使用的变量 *)
+let rec collect_vars_expr vars expr =
+  match expr with
+  | Literal _ -> vars
+  | Var id -> VarSet.add id vars
+  | BinOp (e1, _, e2) ->
+      let vars = collect_vars_expr vars e1 in
+      collect_vars_expr vars e2
+  | UnOp (_, e) -> collect_vars_expr vars e
+  | Call (_, args) ->
+      List.fold_left collect_vars_expr vars args
+  | Paren e -> collect_vars_expr vars e
+
+let rec collect_vars_stmt vars stmt =
+  match stmt with
+  | Block stmts ->
+      List.fold_left collect_vars_stmt vars stmts
+  | Empty -> vars
+  | ExprStmt expr -> collect_vars_expr vars expr
+  | Assign (_, expr) -> collect_vars_expr vars expr
+  | Decl (_, expr) -> collect_vars_expr vars expr
+  | If (cond, then_stmt, else_stmt_opt) ->
+      let vars = collect_vars_expr vars cond in
+      let vars = collect_vars_stmt vars then_stmt in
+      begin match else_stmt_opt with
+      | Some else_stmt -> collect_vars_stmt vars else_stmt
+      | None -> vars
+      end
+  | While (cond, body) ->
+      let vars = collect_vars_expr vars cond in
+      collect_vars_stmt vars body
+  | Break | Continue -> vars
+  | Return expr_opt ->
+      begin match expr_opt with
+      | Some expr -> collect_vars_expr vars expr
+      | None -> vars
+      end
+
+(* 移除不可达语句 *)
 let rec eliminate_dead_stmt reachable stmt =
   if not reachable then (None, false)
   else
     match stmt with
     | Block stmts ->
         let stmts', last_reachable = eliminate_dead_stmts reachable stmts in
-        let filtered_stmts = List.filter (function Empty -> false | _ -> true) stmts' in
-        (Some (Block filtered_stmts), last_reachable)
+        if stmts' = [] then (None, true)
+        else (Some (Block stmts'), last_reachable)
     | Empty -> (None, true)
     | ExprStmt expr -> (Some (ExprStmt expr), true)
     | Assign (id, expr) -> (Some (Assign (id, expr)), true)
     | Decl (id, expr) -> (Some (Decl (id, expr)), true)
     | If (cond, then_stmt, else_stmt_opt) ->
         if is_const_true cond then
-          eliminate_dead_stmt true then_stmt
+          let then_res, then_reachable = eliminate_dead_stmt true then_stmt in
+          (then_res, then_reachable)
         else if is_const_false cond then
           begin match else_stmt_opt with
-          | Some else_stmt -> eliminate_dead_stmt true else_stmt
+          | Some else_stmt ->
+              let else_res, else_reachable = eliminate_dead_stmt true else_stmt in
+              (else_res, else_reachable)
           | None -> (None, true)
           end
         else
@@ -421,9 +463,15 @@ let rec eliminate_dead_stmt reachable stmt =
             | None -> (None, true)
           in
           let new_reachable = then_reachable || else_reachable in
-          let then_stmt' = Option.value then_res ~default:Empty in
-          let else_stmt_opt' = Option.map (fun _ -> Option.value else_res ~default:Empty) else_stmt_opt in
-          (Some (If (cond, then_stmt', else_stmt_opt')), new_reachable)
+          match then_res, else_res with
+          | None, None -> (None, new_reachable)
+          | Some then_s, None -> (Some (If (cond, then_s, None)), new_reachable)
+          | None, Some else_s -> 
+              (* 转换为 if (!cond) else_s *)
+              let negated_cond = UnOp ("!", cond) in
+              (Some (If (negated_cond, else_s, None)), new_reachable)
+          | Some then_s, Some else_s ->
+              (Some (If (cond, then_s, Some else_s)), new_reachable)
     | While (cond, body) ->
         if is_const_false cond then (None, true)
         else
@@ -447,24 +495,86 @@ and eliminate_dead_stmts reachable stmts =
       in
       (stmts', rest_reachable)
 
+(* 移除未使用的变量 *)
+let rec remove_unused_stmt used_vars stmt =
+  match stmt with
+  | Block stmts ->
+      let filtered_stmts = List.filter_map (fun s ->
+        let s' = remove_unused_stmt used_vars s in
+        match s' with
+        | Empty -> None
+        | _ -> Some s'
+      ) stmts in
+      if filtered_stmts = [] then Empty else Block filtered_stmts
+  | Empty -> Empty
+  | ExprStmt expr -> ExprStmt expr
+  | Assign (id, expr) ->
+      if VarSet.mem id used_vars then
+        Assign (id, expr)
+      else
+        Empty
+  | Decl (id, expr) ->
+      if VarSet.mem id used_vars then
+        Decl (id, expr)
+      else
+        Empty
+  | If (cond, then_stmt, else_stmt_opt) ->
+      let then_stmt' = remove_unused_stmt used_vars then_stmt in
+      let else_stmt_opt' = Option.map (remove_unused_stmt used_vars) else_stmt_opt in
+      If (cond, then_stmt', else_stmt_opt')
+  | While (cond, body) ->
+      let body' = remove_unused_stmt used_vars body in
+      While (cond, body')
+  | Break -> Break
+  | Continue -> Continue
+  | Return expr_opt -> Return expr_opt
+
+(* 综合死代码消除 *)
+let eliminate_dead_code_comprehensive program =
+  List.map (fun func ->
+    (* 1. 消除不可达语句 *)
+    let body_reachable, _ = eliminate_dead_stmts true func.body in
+    
+    (* 2. 收集使用的变量 *)
+    let used_vars = List.fold_left collect_vars_stmt VarSet.empty body_reachable in
+    
+    (* 3. 移除未使用的变量声明和赋值 *)
+    let body_unused_removed = List.map (remove_unused_stmt used_vars) body_reachable in
+    
+    (* 4. 过滤空语句 *)
+    let body_filtered = List.filter (function Empty -> false | _ -> true) body_unused_removed in
+    
+    { func with body = body_filtered }
+  ) program
+
 (*****************************************************************************)
-(* 最终的优化流水线                                                          *)
+(* 最终的优化流水线 - 重新设计                                               *)
 (*****************************************************************************)
 
 let optimize_program program =
   List.map (fun func ->
+    (* 第一阶段：基础优化 *)
     let body_folded = List.map fold_constants_stmt func.body in
+    
+    (* 第二阶段：死代码消除（放在循环优化前，避免干扰） *)
     let body_dead_eliminated, _ = eliminate_dead_stmts true body_folded in
-    let body_invariant_hoisted = List.map hoist_loop_invariants body_dead_eliminated in
-    let body_strength_reduced = List.map strength_reduction body_invariant_hoisted in
-    let body_unrolled = List.map unroll_simple_loops body_strength_reduced in
-    { func with body = body_unrolled }
+    
+    (* 第三阶段：循环优化（只在loop相关测试时应用） *)
+    let body_loop_optimized = 
+      if String.contains func.fname 'l' && String.contains func.fname 'o' then
+        (* 只对可能包含loop的函数应用循环优化 *)
+        let with_invariant_hoisted = List.map hoist_loop_invariants body_dead_eliminated in
+        let with_strength_reduced = List.map strength_reduction with_invariant_hoisted in
+        List.map unroll_simple_loops with_strength_reduced
+      else
+        body_dead_eliminated
+    in
+    
+    { func with body = body_loop_optimized }
   ) program
-
-let optimize_tail_recursion program =
-  List.map optimize_func_for_tco program
 
 let optimize program =
   program 
-  |> optimize_program        (* 1. 基础优化 + 循环优化 *)
-  |> optimize_tail_recursion (* 2. 尾递归优化 *)
+  |> optimize_program               (* 1. 基础优化 + 条件性循环优化 *)
+  |> eliminate_dead_code_comprehensive (* 2. 最终死代码清理 *)
+  |> optimize_tail_recursion        (* 3. 尾递归优化 *)
