@@ -160,9 +160,8 @@ let rec collect_vars_stmt vars stmt =
       | None -> vars
       end
 
-let rec eliminate_dead_stmts reachable stmts; (* 声明，因为存在相互递归 *)
-
-and eliminate_dead_stmt reachable stmt =
+(* ✅ 修正点: 将两个相互递归的函数用 `let rec ... and ...` 定义在一起 *)
+let rec eliminate_dead_stmt reachable stmt =
   if not reachable then (None, false)
   else
     match stmt with
@@ -194,7 +193,6 @@ and eliminate_dead_stmt reachable stmt =
           | Some then_s, None -> (Some (If (cond, then_s, None)), new_reachable)
           | None, Some else_s -> (Some (If (UnOp ("!", cond), else_s, None)), new_reachable)
           | Some then_s, Some else_s -> (Some (If (cond, then_s, Some else_s)), new_reachable)
-    (* ✅ 修正点: 将这些分支放在了正确的外层 match 作用域中 *)
     | While (cond, body) ->
         if is_const_false cond then (None, true)
         else
@@ -310,7 +308,7 @@ let optimize_tail_recursion program =
   List.map optimize_func_for_tco program
 
 (*****************************************************************************)
-(* 🚀 优化遍 4 & 5: 循环优化 (CSE & LICM)                                     *)
+(* 🚀 优化遍 4: 循环优化 (LICM)                                               *)
 (*****************************************************************************)
 module LoopOptimizations = struct
     module ExprHashtbl = Hashtbl.Make(struct
