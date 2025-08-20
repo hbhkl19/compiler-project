@@ -83,7 +83,7 @@ let rec fold_constants_expr expr =
       | _ -> UnOp (op, e')
       end
   | Call (fname, args) -> Call (fname, List.map fold_constants_expr args)
-  | Paren e -> fold_constants_expr e (* 括号可以直接移除 *)
+  | Paren e -> fold_constants_expr e
 
 let rec fold_constants_stmt stmt =
   match stmt with
@@ -95,7 +95,7 @@ let rec fold_constants_stmt stmt =
   | If (cond, then_stmt, else_stmt_opt) ->
       let cond' = fold_constants_expr cond in
       begin match cond' with
-      | Literal (IntLit 0) -> 
+      | Literal (IntLit 0) ->
           begin match else_stmt_opt with
           | Some else_stmt -> fold_constants_stmt else_stmt
           | None -> Empty
@@ -110,7 +110,7 @@ let rec fold_constants_stmt stmt =
       let cond' = fold_constants_expr cond in
       let body' = fold_constants_stmt body in
       begin match cond' with
-      | Literal (IntLit 0) -> Empty (* 永假循环直接移除 *)
+      | Literal (IntLit 0) -> Empty
       | _ -> While (cond', body')
       end
   | Break -> Break
@@ -160,7 +160,9 @@ let rec collect_vars_stmt vars stmt =
       | None -> vars
       end
 
-let rec eliminate_dead_stmt reachable stmt =
+let rec eliminate_dead_stmts reachable stmts; (* 声明，因为存在相互递归 *)
+
+and eliminate_dead_stmt reachable stmt =
   if not reachable then (None, false)
   else
     match stmt with
@@ -187,14 +189,12 @@ let rec eliminate_dead_stmt reachable stmt =
             | None -> (None, true)
           in
           let new_reachable = then_reachable || else_reachable in
-          (* ✅ 修正点: `match` 语句只应处理 `(stmt option * stmt option)` *)
           match then_res, else_res with
           | None, None -> (None, new_reachable)
           | Some then_s, None -> (Some (If (cond, then_s, None)), new_reachable)
           | None, Some else_s -> (Some (If (UnOp ("!", cond), else_s, None)), new_reachable)
           | Some then_s, Some else_s -> (Some (If (cond, then_s, Some else_s)), new_reachable)
-    
-    (* ✅ 修正点: 将这些分支移到外层 match *)
+    (* ✅ 修正点: 将这些分支放在了正确的外层 match 作用域中 *)
     | While (cond, body) ->
         if is_const_false cond then (None, true)
         else
@@ -309,10 +309,8 @@ let optimize_func_for_tco (func: func_def) : func_def =
 let optimize_tail_recursion program =
   List.map optimize_func_for_tco program
 
-
 (*****************************************************************************)
 (* 🚀 优化遍 4 & 5: 循环优化 (CSE & LICM)                                     *)
-(* 备注: 此处将CSE和LICM的逻辑合并，以一个更强大的LICM实现为主              *)
 (*****************************************************************************)
 module LoopOptimizations = struct
     module ExprHashtbl = Hashtbl.Make(struct
@@ -402,5 +400,5 @@ let optimize program =
   |> fold_constants
   |> eliminate_dead_code
   |> optimize_tail_recursion
-  |> LoopOptimizations.optimize (* 应用合并后的循环优化 *)
+  |> LoopOptimizations.optimize
   |> eliminate_dead_code
