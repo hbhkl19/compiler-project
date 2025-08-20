@@ -77,7 +77,7 @@ and extract_invariants modified_vars stmt =
   | Block stmts ->
       let (invariants, remaining) = List.fold_left (fun (inv_acc, rem_acc) s ->
         match s with
-        | Decl (id, expr) when is_pure_computation s && 
+        | Decl (_, expr) when is_pure_computation s && 
                               not (expr_depends_on_vars modified_vars expr) ->
             (s :: inv_acc, rem_acc)
         | _ ->
@@ -100,14 +100,14 @@ and hoist_loop_invariants_stmt stmt =
 (*****************************************************************************)
 
 (* 检测循环中的归纳变量模式 *)
-let rec find_induction_vars stmt =
+let find_induction_vars stmt =
   let induction_vars = ref VarSet.empty in
   let rec analyze_stmt s =
     match s with
     | Block stmts -> List.iter analyze_stmt stmts
-    | Assign (id, BinOp(Var v, "+", Literal (IntLit n))) when v = id ->
+    | Assign (id, BinOp(Var v, "+", Literal (IntLit _))) when v = id ->
         induction_vars := VarSet.add id !induction_vars
-    | Assign (id, BinOp(Literal (IntLit n), "+", Var v)) when v = id ->
+    | Assign (id, BinOp(Literal (IntLit _), "+", Var v)) when v = id ->
         induction_vars := VarSet.add id !induction_vars
     | If (_, then_s, else_opt) ->
         analyze_stmt then_s;
@@ -134,7 +134,7 @@ let rec strength_reduction stmt =
 and reduce_strength_in_stmt induction_vars stmt =
   let rec reduce_expr expr =
     match expr with
-    | BinOp (Var v, "*", Literal (IntLit n)) when VarSet.mem v induction_vars ->
+    | BinOp (Var v, "*", Literal (IntLit _)) when VarSet.mem v induction_vars ->
         (* 将乘法转换为累加：v * n 可以用一个累加变量替代 *)
         expr (* 这里简化实现，实际需要引入新的累加变量 *)
     | BinOp (e1, op, e2) ->
