@@ -1,12 +1,4 @@
-| While (cond, body) ->
-        if is_const_false cond then (None, true)
-        else
-          let body_res, _ = eliminate_dead_stmt true body in
-          let body' = Option.value body_res ~default:Empty in
-          (Some (While (cond, body')), true)
-    | Break -> (Some Break, false)
-    | Continue -> (Some Continue, false)
-    | Return expr_opt -> (Some (Return expr_opt), false)open Ast
+open Ast
 
 (*****************************************************************************)
 (* 循环不变式提升 (Loop Invariant Code Motion)                               *)
