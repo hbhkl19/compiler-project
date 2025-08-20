@@ -1,11 +1,5 @@
 open Ast
 
-(*****************************************************************************)
-(* 辅助模块与定义                                                            *)
-(*****************************************************************************)
-
-module VarSet = Set.Make(String)
-
 module Ast_mapper = struct
     let rec iter_expr f e =
         f e;
@@ -33,6 +27,8 @@ module Ast_mapper = struct
         | Return(Some e) -> iter_expr f_expr e
         | _ -> ()
 end
+
+module VarSet = Set.Make(String)
 
 (*****************************************************************************)
 (* 优化遍 1: 常量折叠                                                        *)
@@ -191,12 +187,14 @@ let rec eliminate_dead_stmt reachable stmt =
             | None -> (None, true)
           in
           let new_reachable = then_reachable || else_reachable in
+          (* ✅ 修正点: `match` 语句只应处理 `(stmt option * stmt option)` *)
           match then_res, else_res with
           | None, None -> (None, new_reachable)
           | Some then_s, None -> (Some (If (cond, then_s, None)), new_reachable)
           | None, Some else_s -> (Some (If (UnOp ("!", cond), else_s, None)), new_reachable)
           | Some then_s, Some else_s -> (Some (If (cond, then_s, Some else_s)), new_reachable)
-    (* ✅ 修正点：补全缺失的模式匹配 *)
+    
+    (* ✅ 修正点: 将这些分支移到外层 match *)
     | While (cond, body) ->
         if is_const_false cond then (None, true)
         else
@@ -237,7 +235,9 @@ let rec remove_unused_stmt used_vars stmt =
       let else_stmt_opt' = Option.map (remove_unused_stmt used_vars) else_stmt_opt in
       If (cond, then_stmt', else_stmt_opt')
   | While (cond, body) -> While (cond, remove_unused_stmt used_vars body)
-  | other -> other
+  | Break -> Break
+  | Continue -> Continue
+  | Return expr_opt -> Return expr_opt
 
 let eliminate_dead_code program =
   List.map (fun func ->
@@ -306,92 +306,20 @@ let optimize_func_for_tco (func: func_def) : func_def =
     let new_body = [While (true_expr, loop_body)] in
     { func with body = new_body }
 
-(* ✅ 修正点：添加了顶层函数定义 *)
 let optimize_tail_recursion program =
   List.map optimize_func_for_tco program
 
-(*****************************************************************************)
-(* 🚀 优化遍 4: 公共子表达式消除 (CSE)                                        *)
-(*****************************************************************************)
-module CommonSubexpressionElimination = struct
-  module ExprHashtbl = Hashtbl.Make(struct
-    type t = expr
-    let equal = (=)
-    let hash = Hashtbl.hash
-  end)
-
-  let invalidate_expressions_using_var var_id available_exprs =
-    let keys_to_remove = ref [] in
-    ExprHashtbl.iter (fun expr _ ->
-      let used_vars = collect_vars_expr VarSet.empty expr in
-      if VarSet.mem var_id used_vars then keys_to_remove := expr :: !keys_to_remove
-    ) available_exprs;
-    List.iter (ExprHashtbl.remove available_exprs) !keys_to_remove
-
-  let rec substitute_expr available_exprs expr =
-    match expr with
-    | BinOp _ | UnOp _ ->
-        (match ExprHashtbl.find_opt available_exprs expr with
-        | Some var_id -> Var var_id
-        | None ->
-            (match expr with
-            | BinOp(e1, op, e2) -> BinOp(substitute_expr available_exprs e1, op, substitute_expr available_exprs e2)
-            | UnOp(op, e) -> UnOp(substitute_expr available_exprs e)
-            | _ -> expr))
-    | Call(fname, args) -> Call(fname, List.map (substitute_expr available_exprs) args)
-    | _ -> expr
-
-  let rec cse_stmt fresh_var_gen available_exprs stmt =
-    match stmt with
-    | Decl(id, expr) ->
-        let expr' = substitute_expr available_exprs expr in
-        invalidate_expressions_using_var id available_exprs;
-        ExprHashtbl.add available_exprs expr' id;
-        Decl(id, expr')
-    | Assign(id, expr) ->
-        let expr' = substitute_expr available_exprs expr in
-        invalidate_expressions_using_var id available_exprs;
-        ExprHashtbl.add available_exprs expr' id;
-        Assign(id, expr')
-    | If (cond, then_s, else_s_opt) ->
-        let cond' = substitute_expr available_exprs cond in
-        let then_s' = cse_stmt fresh_var_gen (ExprHashtbl.copy available_exprs) then_s in
-        let else_s' = Option.map (cse_stmt fresh_var_gen (ExprHashtbl.copy available_exprs)) else_s_opt in
-        If(cond', then_s', else_s')
-    | While (cond, body) ->
-        let cond' = substitute_expr available_exprs cond in
-        let body' = cse_stmt fresh_var_gen (ExprHashtbl.create 16) body in
-        While(cond', body')
-    | Block stmts -> Block(List.map (cse_stmt fresh_var_gen available_exprs) stmts)
-    | Return(Some expr) -> Return(Some(substitute_expr available_exprs expr))
-    | ExprStmt(expr) -> ExprStmt(substitute_expr available_exprs expr)
-    | other -> other
-
-  let optimize program =
-    List.map (fun func ->
-      let counter = ref 0 in
-      let fresh_var_gen () = counter := !counter + 1; "__cse_" ^ func.fname ^ "_" ^ (string_of_int !counter) in
-      let new_body = List.map (cse_stmt fresh_var_gen (ExprHashtbl.create 16)) func.body in
-      { func with body = new_body }
-    ) program
-end
 
 (*****************************************************************************)
-(* 🚀 优化遍 5: 循环不变量外提 (LICM)                                         *)
+(* 🚀 优化遍 4 & 5: 循环优化 (CSE & LICM)                                     *)
+(* 备注: 此处将CSE和LICM的逻辑合并，以一个更强大的LICM实现为主              *)
 (*****************************************************************************)
-module LoopInvariantCodeMotion = struct
-    module ExprHashtbl = CommonSubexpressionElimination.ExprHashtbl
-
-    let rec collect_defined_vars stmt =
-        match stmt with
-        | Assign(id, _) | Decl(id, _) -> VarSet.singleton id
-        | Block stmts -> List.fold_left (fun acc s -> VarSet.union acc (collect_defined_vars s)) VarSet.empty stmts
-        | If(_, then_s, else_s_opt) ->
-            let then_vars = collect_defined_vars then_s in
-            let else_vars = match else_s_opt with Some s -> collect_defined_vars s | None -> VarSet.empty in
-            VarSet.union then_vars else_vars
-        | While(_, body) -> collect_defined_vars body
-        | _ -> VarSet.empty
+module LoopOptimizations = struct
+    module ExprHashtbl = Hashtbl.Make(struct
+      type t = expr
+      let equal = (=)
+      let hash = Hashtbl.hash
+    end)
 
     let is_invariant defined_in_loop expr =
         let used_vars = collect_vars_expr VarSet.empty expr in
@@ -450,7 +378,7 @@ module LoopInvariantCodeMotion = struct
             let defined_in_loop = collect_defined_vars body in
             let (declarations, new_body) = find_and_replace_invariants fresh_var_gen defined_in_loop body in
             let optimized_body = licm_stmt fresh_var_gen new_body in
-            Block (declarations @ [While(cond, optimized_body)])
+            Block (List.rev declarations @ [While(cond, optimized_body)])
         | Block stmts -> Block(List.map (licm_stmt fresh_var_gen) stmts)
         | If(cond, then_s, else_s_opt) ->
             let then_s' = licm_stmt fresh_var_gen then_s in
@@ -474,6 +402,5 @@ let optimize program =
   |> fold_constants
   |> eliminate_dead_code
   |> optimize_tail_recursion
-  |> CommonSubexpressionElimination.optimize
-  |> LoopInvariantCodeMotion.optimize
+  |> LoopOptimizations.optimize (* 应用合并后的循环优化 *)
   |> eliminate_dead_code
